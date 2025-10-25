@@ -43,6 +43,16 @@ class LITCI_Import_Service
         $title   = wp_strip_all_tags($data['title']['rendered'] ?? 'Sem título');
         $content = $data['content']['rendered'] ?? '';
         $date    = $data['date'] ?? current_time('mysql');
+        $political_author = $data['political_author'] ?? null;
+        $tagline = $data['tagline'] ?? '';
+        $menu_order = $data['menu_order'] ?? 0;
+
+        if (isset($data['_embedded']['wp:term'][1])) {
+            $tags_data = $data['_embedded']['wp:term'][1];
+            $tag_names = array_map(function ($term) {
+                return $term['name'];
+            }, $tags_data);
+        }
 
         // Cria o post local inicialmente com o conteúdo remoto
         $post_id = wp_insert_post([
@@ -51,6 +61,7 @@ class LITCI_Import_Service
             'post_date'    => $date,
             'post_status'  => 'draft',
             'post_type'    => 'post',
+            'menu_order'   => $menu_order,
         ]);
 
         if (is_wp_error($post_id)) {
@@ -79,16 +90,35 @@ class LITCI_Import_Service
         $translated_title = $this->translator->translate_content_with_openai(wp_strip_all_tags($title));
         $final_title = wp_strip_all_tags($translated_title);
 
-        error_log("Conteúdo final para {$final_title} (ID {$post_id}): " . substr(strip_tags($content), 0, 500));
+        // Traduz tagline
+        if($tagline){
+            $translatedTagline = $this->translator->translate_content_with_openai(wp_strip_all_tags($tagline));
+            $finalTagline = wp_strip_all_tags($translatedTagline);
+        } else {
+            $finalTagline = $this->translator->generate_political_tagline($final_content);
+        }
+
+        // Traduz tags
+        if($tag_names){
+            $translatedTags = $this->translator->translate_tags_with_openai($tag_names);
+        } else {
+            $translatedTags = $this->translator->generate_keywords_from_content($final_content);
+        }
+        
+        
+        error_log("[===== LITCI IMPORTER =====] Conteudo final para {$final_title} (ID {$post_id}): " . substr(strip_tags($content), 0, 500));
 
         // Atualiza o post com o novo conteúdo (já com imagens locais)
         wp_update_post([
             'ID'            => $post_id,
             'post_title'    => $final_title,
             'post_content'  => $final_content,
+            'tags_input'     => $translatedTags,
             'meta_input'    => [
                 '_edit_last'    => get_current_user_id(),
                 '_gutenberg_blocks' => true, // Flag para o editor de blocos
+                'litci_post_political_author' => $political_author,
+                'litci_post_tagline' => $finalTagline,
             ],
         ]);
 
@@ -104,41 +134,6 @@ class LITCI_Import_Service
             'edit_url' => $edit_url, // URL para qual será redirecionado
             'image'   => $image_url ?: null
         ]);
-    }
-
-    private function explodeInMediaArray($content): array
-    {
-        // O preg_split irá:
-        // 1. Dividir a string nos delimitadores (os blocos de mídia).
-        // 2. Manter os delimitadores no array resultante (PREG_SPLIT_DELIM_CAPTURE).
-        // 3. Remover entradas vazias (PREG_SPLIT_NO_EMPTY).
-
-        $media_pattern = '/(
-            <figure.*?>.*?<\/figure>|
-            <img[^>]+>|
-            <iframe.*?>.*?<\/iframe>|
-            <video.*?>.*?<\/video>|
-            <blockquote\s+class=["\']instagram-media["\'].*?<\/blockquote>|
-            <embed[^>]+>|
-            <object.*?>.*?<\/object>
-        )/isx';
-
-        $exploded_content = preg_split(
-            $media_pattern,
-            $content,
-            -1, // Sem limite
-            PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY
-        );
-
-        // Limpeza final para remover blocos que sejam apenas espaços em branco ou quebras de linha
-        $final_blocks = [];
-        foreach ($exploded_content as $block) {
-            if (trim($block) !== '') {
-                $final_blocks[] = $block;
-            }
-        }
-
-        return $final_blocks ?? [];
     }
 
     private function processContent($content, $post_id)
@@ -163,6 +158,54 @@ class LITCI_Import_Service
         return $final_content;
     }
 
+    /*==================================================
+        Expolode o HTML do conteúdo em
+        um array para ser processado
+    ==================================================*/
+    private function explodeInMediaArray($content): array
+    {
+        // O preg_split irá:
+        // 1. Dividir a string nos delimitadores (os blocos de mídia).
+        // 2. Manter os delimitadores no array resultante (PREG_SPLIT_DELIM_CAPTURE).
+        // 3. Remover entradas vazias (PREG_SPLIT_NO_EMPTY).
+
+        $block_pattern = '/(
+            <figure.*?>.*?<\/figure>|
+            <img[^>]+>|
+            <iframe.*?>.*?<\/iframe>|
+            <video.*?>.*?<\/video>|
+            <blockquote\s+class=["\']instagram-media["\'].*?<\/blockquote>|
+            <embed[^>]+>|
+            <object.*?>.*?<\/object>|
+            <p.*?>.*?<\/p>|
+            <h[1-6].*?>.*?<\/h[1-6]>|
+            <ul.*?>.*?<\/ul>|
+            <ol.*?>.*?<\/ol> |
+            <table.*?>.*?><\/table>
+        )/isx';
+
+        $exploded_content = preg_split(
+            $block_pattern,
+            $content,
+            -1, // Sem limite
+            PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY
+        );
+
+        // Limpeza final para remover blocos que sejam apenas espaços em branco ou quebras de linha
+        $final_blocks = [];
+        foreach ($exploded_content as $block) {
+            if (trim($block) !== '') {
+                $final_blocks[] = $block;
+            }
+        }
+
+        return $final_blocks ?? [];
+    }
+
+    /*==================================================
+        Converte eventuais blocos clássicos
+        para blocos Guttenberg
+    ==================================================*/
     private function litci_wrap_block($block)
     {
         if (preg_match('/^(<h[1-6]>)/', $block)) {
